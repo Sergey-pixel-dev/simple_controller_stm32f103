@@ -1,0 +1,5 @@
+/home/serg50012/LIM/modbus/modbus_stm32f103/build/Debug/CMakeFiles/modbus_stm32f103.dir
+/home/serg50012/LIM/modbus/modbus_stm32f103/build/Debug/CMakeFiles/edit_cache.dir
+/home/serg50012/LIM/modbus/modbus_stm32f103/build/Debug/CMakeFiles/rebuild_cache.dir
+/home/serg50012/LIM/modbus/modbus_stm32f103/build/Debug/cmake/stm32cubemx/CMakeFiles/edit_cache.dir
+/home/serg50012/LIM/modbus/modbus_stm32f103/build/Debug/cmake/stm32cubemx/CMakeFiles/rebuild_cache.dir
