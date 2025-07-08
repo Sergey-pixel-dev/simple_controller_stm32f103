@@ -180,6 +180,9 @@ int main(void)
   SET_BIT(*usDiscreteBuf, 1);
   SET_BIT(*usDiscreteBuf, 1 << 2);
 
+  usRegHoldingBuf[0] = 1000;
+  usRegHoldingBuf[1] = 30;
+  usRegHoldingBuf[2] = 200;
   HAL_TIM_OC_Start_IT(&htim4, TIM_CHANNEL_1);
   // StartTimers();
   //   NVIC_EnableIRQ(EXTI15_10_IRQn);
