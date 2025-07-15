@@ -48,22 +48,16 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-
+    ${CMAKE_SOURCE_DIR}/Core/Src/modbus_crc.c
+    ${CMAKE_SOURCE_DIR}/Core/Src/modbusSlave.c
 
 )
-
-# Рекурсивно добавляем все .c файлы из каталога Modules/modbus
-file(GLOB_RECURSE MODBUS_SOURCES ${CMAKE_SOURCE_DIR}/Modules/modbus/*.c)
-
-# Добавляем найденные файлы в список исходников для сборки
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${MODBUS_SOURCES})
 
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
-    ${CMAKE_SOURCE_DIR}/Modules/modbus/include
-    ${CMAKE_SOURCE_DIR}/Modules/modbus/port
+
 
 )
 

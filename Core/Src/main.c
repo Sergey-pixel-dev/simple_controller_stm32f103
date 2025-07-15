@@ -21,10 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "mb.h"
-#include "mbport.h"
-#include "mt_port.h"
-
+#include "modbusSlave.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,15 +31,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define REG_INPUT_START 31001
-#define REG_HOLDING_START 41001
-#define COILS_START 00001
-#define DISCRETE_START 10001
-
-#define COILS_N 1
-#define DISCRETE_N 4
-#define REG_INPUT_NREGS 58
-#define REG_HOLDING_NREGS 39
 
 /* USER CODE END PD */
 
@@ -66,26 +54,24 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-static uint16_t usRegInputStart = REG_INPUT_START;
-static uint16_t usRegInputBuf[REG_INPUT_NREGS];
-// index 0 - 8: входы IN0-IN8
-static uint16_t usRegHoldingStart = REG_HOLDING_START;
-static uint16_t usRegHoldingBuf[REG_HOLDING_NREGS];
-// 0 - HZ, 1 -длительность импулсьа, 2 - интервал
 
-static uint16_t usCoilsStart = COILS_START;
-static uint16_t usCoilsBuf[1];
-// X0000000 00000000 - 1, - ВКЛ ИМПУЛЬС
-static uint16_t usDiscreteStart = DISCRETE_START;
-static uint16_t usDiscreteBuf[1];
-// XXXX0000 00000000,
-// 1, 2, 3, 4 по порядку - ВКЛ БЛОК НАКАЛА, ВКЛ У.Э., ВКЛ -25кВ, ВКЛ HE, LE
+uint16_t adcData_trash[N_SAMPLES]; // чтоб первый запуск записался сюда и не портил frame
+uint8_t frame_8int_V[2 * 36 * N_SAMPLES];
+uint16_t frame[36 * N_SAMPLES];
+uint16_t frameV[36 * N_SAMPLES];
+uint8_t i = -1;
+uint16_t vdda = 3300;
+uint16_t VREFINT_CAL = 1200;
+
 uint16_t adcData[NUM_CHANNELS * NUM_SAMPLES];
 uint16_t adcVoltage[NUM_CHANNELS];
 
 uint32_t last_tick = 0;
 uint32_t current_tick = 0;
 
+// UART (modbus)
+uint8_t RxData[256];
+uint8_t TxData[256];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -105,7 +91,53 @@ static void MX_TIM4_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void ADC_init()
+{
+  // настройка ADC1
+  RCC->APB2ENR |= RCC_APB2ENR_ADC1EN; //  такты на ADC1
 
+  ADC1->SMPR1 |= ADC_SMPR1_SMP17_2 | ADC_SMPR1_SMP17_1; // для vref
+  ADC1->SMPR2 = 0;                                      // 1.5 cycles для оцифровки
+  // добавление в последовательность каналов
+  ADC1->SQR1 = 0;
+  ADC1->SQR2 = 0;
+  ADC1->SQR3 = 0;
+
+  // ADC1->SQR3 |= ADC_SQR3_SQ1_3 | ADC_SQR3_SQ1_0; // 9 канал, rank - 1
+  ADC1->SQR3 |= ADC_SQR3_SQ1_4 | ADC_SQR3_SQ1_0; // 17 канал, rank - 2
+  ADC1->CR2 |= ADC_CR2_TSVREFE;
+
+  ADC1->CR2 |=           // ADC_CR2_CONT |       // включаем если нужно непрерывное преобразование последовательности в цикле
+      ADC_CR2_DMA        // включаем работу с DMA
+      | ADC_CR2_EXTTRIG  // включаем работу от внешнего события
+      | ADC_CR2_EXTSEL   // выбираем триггером запуска регулярной последовательности событие SWSTART
+      | ADC_CR2_JEXTSEL; // выбираем триггером запуска выделенной последовательности событие JSWSTART дабы эти каналы не отнимали у мк времени
+  // ADC1->CR1 |= ADC_CR1_SCAN;      // включаем автоматический перебор всех каналов в последовательности
+
+#define ADC_ON                  \
+  ADC1->CR2 |= ADC_CR2_ADON;    \
+  ADC1->CR2 |= ADC_CR2_SWSTART; \
+  DMA1_Channel1->CCR |= DMA_CCR_TCIE | DMA_CCR_EN; // включаем преобразование прерывание DMA
+#define ADC_OFF                  \
+  ADC->CR2 &= (~(ADC_CR2_ADON)); \
+  DMA1_Channel1->CCR &= (~(DMA_CCR_TCIE | DMA_CCR_EN)); // выключаем преобразование и прерывание DMA
+
+  return;
+}
+void ADC_DMA_Init()
+{
+  RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+  DMA1_Channel1->CPAR = ADC1_BASE + 0x4C;                          // Загружаем адрес регистра DR
+  DMA1_Channel1->CMAR = (uint32_t)adcData_trash;                   // грузим адрес буфера обмена
+  DMA1_Channel1->CNDTR = 8;                                        // длина буфера
+  DMA1_Channel1->CCR |= DMA_CCR_PL_1 | DMA_CCR_PL_0 | DMA_CCR_MINC // инкремент адреса памяти
+                        | DMA_CCR_PSIZE_0                          // размерность данных периферии 16 бит
+                        | DMA_CCR_MSIZE_0;                         // размерность данных памяти 16 bit
+                                                                   //| DMA_CCR_CIRC;                            // закольцевать буфер
+
+  DMA1_Channel1->CCR |= DMA_CCR_TCIE; // прерывание по заполнению
+  NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+}
 /* USER CODE END 0 */
 
 /**
@@ -137,55 +169,54 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
+  // MX_DMA_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
-  MX_ADC1_Init();
+  // MX_ADC1_Init();
   MX_SPI1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
+  /*Настраиваем ADC + DMA*/
+  ADC_init();
+  ADC_DMA_Init();
 
-  // очистка буферов (нужна ли?)
-  for (uint8_t i = 0; i < REG_INPUT_NREGS; i++)
-  {
-    usRegInputBuf[i] = 0;
-  }
-  for (uint16_t i = 0; i < REG_HOLDING_NREGS; i++)
-  {
-    usRegHoldingBuf[i] = 0;
-  }
-  for (uint16_t i = 0; i < 1; i++)
-  {
-    usDiscreteBuf[i] = 0;
-  }
-  for (uint16_t i = 0; i < 1; i++)
-  {
-    usCoilsBuf[i] = 0;
-  }
+  ADC1->CR2 |= ADC_CR2_ADON;
+  // Калибровка
+  HAL_Delay(1);
+  ADC1->CR2 |= ADC_CR2_RSTCAL;
+  while (READ_BIT(ADC1->CR2, ADC_CR2_RSTCAL))
+    ;
+  ADC1->CR2 |= ADC_CR2_CAL;
+  while (READ_BIT(ADC1->CR2, ADC_CR2_CAL))
+    ;
+  uint16_t calibration = ADC1->DR;
+  ADC1->CR2 |= ADC_CR2_SWSTART;
+  HAL_Delay(1);
+  /* while (!(ADC1->SR & ADC_SR_EOC)) //иногда багуется и не идет
+    ; */
 
-  MT_PORT_SetTimerModule(&htim3);
-  MT_PORT_SetUartModule(&huart1);
+  uint16_t raw_vrefint = ADC1->DR;
+  vdda = VREFINT_CAL * 4095 / raw_vrefint; // теперь сравниваем не с 3.3v, а с vdda
 
-  eMBErrorCode eStatus;
-  eStatus = eMBInit(MB_RTU, 0x0A, 0, 19200, MB_PAR_NONE);
-  eStatus = eMBEnable();
+  ADC1->SQR3 = ADC_SQR3_SQ1_3 | ADC_SQR3_SQ1_0;
+  ADC1->CR2 |= ADC_CR2_CONT;
+  DMA1_Channel1->CCR |= DMA_CCR_TCIE | DMA_CCR_EN;
+  ADC1->CR2 |= ADC_CR2_SWSTART;
 
-  if (eStatus != MB_ENOERR)
-  {
-    // Error handling
-  }
-
+  /*Первоначальный запуск*/
+  // Включаем БЛок накала и катод для теста
   SET_BIT(*usDiscreteBuf, 1);
   SET_BIT(*usDiscreteBuf, 1 << 2);
-
+  // Параметры сигнала "Запуск"
   usRegHoldingBuf[0] = 1000;
   usRegHoldingBuf[1] = 30;
   usRegHoldingBuf[2] = 200;
-  HAL_TIM_OC_Start_IT(&htim4, TIM_CHANNEL_1);
-  // StartTimers();
-  //   NVIC_EnableIRQ(EXTI15_10_IRQn);
+  SetHZ();
+  SetPulse();
+  NVIC_DisableIRQ(EXTI15_10_IRQn);
+  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -196,7 +227,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    eMBPoll();
   }
   /* USER CODE END 3 */
 }
@@ -387,7 +417,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -654,7 +684,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 19200;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -715,167 +745,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/*----------------------------------------------------------------------------*/
-eMBErrorCode eMBRegInputCB(UCHAR *pucRegBuffer, uint16_t usAddress, uint16_t usNRegs)
-{
-  eMBErrorCode eStatus = MB_ENOERR;
-  int iRegIndex;
-
-  if ((usAddress >= REG_INPUT_START) &&
-      (usAddress + usNRegs <= REG_INPUT_START + REG_INPUT_NREGS))
-  {
-    iRegIndex = (int)(usAddress - usRegInputStart);
-
-    while (usNRegs > 0)
-    {
-      *pucRegBuffer++ = (unsigned char)(usRegInputBuf[iRegIndex] >> 8);
-      *pucRegBuffer++ = (unsigned char)(usRegInputBuf[iRegIndex] & 0xFF);
-
-      iRegIndex++;
-      usNRegs--;
-    }
-  }
-  else
-  {
-    eStatus = MB_ENOREG;
-  }
-
-  return eStatus;
-}
-
-/*----------------------------------------------------------------------------*/
-eMBErrorCode eMBRegHoldingCB(UCHAR *pucRegBuffer, uint16_t usAddress, uint16_t usNRegs,
-                             eMBRegisterMode eMode)
-{
-  eMBErrorCode eStatus = MB_ENOERR;
-  int iRegIndex;
-
-  if ((usAddress >= REG_HOLDING_START) &&
-      (usAddress + usNRegs <= REG_HOLDING_START + REG_HOLDING_NREGS))
-  {
-    iRegIndex = (int)(usAddress - usRegHoldingStart);
-    if (eMode == MB_REG_READ)
-    {
-
-      while (usNRegs > 0)
-      {
-        *pucRegBuffer++ = (unsigned char)(usRegHoldingBuf[iRegIndex] >> 8);
-        *pucRegBuffer++ = (unsigned char)(usRegHoldingBuf[iRegIndex] & 0xFF);
-
-        iRegIndex++;
-        usNRegs--;
-      }
-    }
-    else
-    {
-      while (usNRegs > 0)
-      {
-        usRegHoldingBuf[iRegIndex] = (unsigned char)*pucRegBuffer++ << 8;
-        usRegHoldingBuf[iRegIndex] |= (unsigned char)*pucRegBuffer++;
-
-        iRegIndex++;
-        usNRegs--;
-      }
-      if (usAddress - REG_HOLDING_START <= 2)
-      {
-        SetHZ();
-        SetPulse();
-      }
-    }
-  }
-  else
-  {
-    eStatus = MB_ENOREG;
-  }
-
-  return eStatus;
-}
-
-/*----------------------------------------------------------------------------*/
-eMBErrorCode eMBRegCoilsCB(UCHAR *pucRegBuffer, uint16_t usAddress, uint16_t usNCoils,
-                           eMBRegisterMode eMode)
-{
-  eMBErrorCode eStatus = MB_ENOERR;
-  uint32_t iCoils;
-  uint32_t count = 0;
-  if ((usAddress >= COILS_START) &&
-      (usAddress + usNCoils <= COILS_START + COILS_N))
-  {
-    iCoils = (uint32_t)(usAddress - usCoilsStart);
-    if (eMode == MB_REG_READ)
-    {
-      while (usNCoils > 0)
-      {
-        if (READ_BIT(*(usCoilsBuf + iCoils / 16), 1 << (iCoils % 16)))
-          SET_BIT(*pucRegBuffer, 1 << (count % 8));
-        else
-          CLEAR_BIT(*pucRegBuffer, 1 << (count % 8));
-        usNCoils--;
-        iCoils++;
-        count++;
-        if (count % 8 == 0)
-          pucRegBuffer++;
-      }
-    }
-    else
-    {
-      while (usNCoils > 0)
-      {
-        if (*pucRegBuffer) //== 0xFF00, но pucRegBuffer содержит 1
-          SET_BIT(*(usCoilsBuf + iCoils / 16), 1 << (iCoils % 16));
-        else
-          CLEAR_BIT(*(usCoilsBuf + iCoils / 16), 1 << (iCoils % 16));
-        usNCoils--;
-        iCoils++;
-        pucRegBuffer++;
-      }
-      if (usAddress == COILS_START) // адрес, где флаг для включения импульсов
-      {
-        if (READ_BIT(*usCoilsBuf, 1 << 0))
-          StartTimers();
-        else
-          StopTimers();
-      }
-    }
-  }
-  else
-  {
-    eStatus = MB_ENOREG;
-  }
-
-  return eStatus;
-}
-
-/*----------------------------------------------------------------------------*/
-eMBErrorCode eMBRegDiscreteCB(UCHAR *pucRegBuffer, uint16_t usAddress, uint16_t usNDiscrete)
-{
-  eMBErrorCode eStatus = MB_ENOERR;
-  uint32_t iDis;
-  uint32_t count = 0;
-  if ((usAddress >= DISCRETE_START) &&
-      (usAddress + usNDiscrete <= DISCRETE_START + DISCRETE_N))
-  {
-    iDis = (uint32_t)(usAddress - usDiscreteStart);
-    while (usNDiscrete > 0)
-    {
-      if (READ_BIT(*(usDiscreteBuf + iDis / 16), 1 << (iDis % 16)))
-        SET_BIT(*pucRegBuffer, 1 << count);
-      else
-        CLEAR_BIT(*pucRegBuffer, 1 << count);
-      usNDiscrete--;
-      iDis++;
-      count++;
-      if (count % 8 == 0)
-        pucRegBuffer++;
-    }
-  }
-  else
-  {
-    eStatus = MB_ENOREG;
-  }
-
-  return eStatus;
-}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
@@ -923,6 +792,45 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       break;
     }
   }
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  if (RxData[0] == SLAVE_ID)
+  {
+    switch (RxData[1])
+    {
+    case 0x03:
+      readHoldingRegs();
+      break;
+    case 0x04:
+      readInputRegs();
+      break;
+    case 0x01:
+      readCoils();
+      break;
+    case 0x02:
+      readInputs();
+      break;
+    case 0x06:
+      writeSingleReg();
+      break;
+    case 0x10:
+      writeHoldingRegs();
+      break;
+    case 0x05:
+      writeSingleCoil();
+      break;
+    case 0x0F:
+      writeMultiCoils();
+      break;
+    default:
+      modbusException(ILLEGAL_FUNCTION);
+      break;
+    }
+  }
+
+  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
 }
 
 void StopTimers()

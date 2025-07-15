@@ -24,6 +24,7 @@
         "string.h": "c",
         "stdlib.h": "c",
         "mbrtu.h": "c",
-        "mbfunc.h": "c"
+        "mbfunc.h": "c",
+        "modbusslave.h": "c"
     }
 }
